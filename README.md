@@ -1,7 +1,10 @@
 # OCI Image Unpacker
 
-离线排查容器文件缺失时，从交付镜像还原最终根文件系统的服务。
-上传仅含单个 manifest 的 OCI Image Layout tar，当次请求返回还原后的 `rootfs.tar`。
+离线排查容器文件缺失时，从交付镜像还原最终根文件系统的服务；同时可把多平台
+交付镜像裁剪成单平台、随包保留构建证明的 OCI Image Layout tar，供隔离站点使用。
+
+- `POST /unpack`：上传仅含单个 manifest 的 OCI Image Layout tar，返回还原后的 `rootfs.tar`；
+- `POST /export`：上传未压缩的多平台 OCI Image Layout tar，提交目标平台，返回裁剪后的 OCI tar。
 
 ## 快速开始（docker compose）
 
@@ -21,6 +24,11 @@ curl -OJ http://localhost:8000/sample-image          # 下载样例镜像
 curl -F "file=@sample-image.tar" -OJ \
      http://localhost:8000/unpack                    # 得到 rootfs.tar
 tar -tf rootfs.tar                                   # 查看还原结果
+
+# 裁剪多平台镜像：注意上传的是未压缩的 OCI Image Layout tar
+curl -F "file=@multi-platform.tar" \
+     -F "os=linux" -F "architecture=arm64" -F "variant=v8" \
+     -OJ http://localhost:8000/export                 # 得到 linux-arm64-v8.tar
 ```
 
 本地开发（不用 Docker）：
@@ -36,6 +44,7 @@ pytest                 # 运行测试
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/unpack` | 上传 OCI Image Layout tar（单 manifest），返回 `rootfs.tar`；任何校验/解包失败返回 400，不返回残缺文件系统 |
+| `POST` | `/export` | 上传多平台 OCI Image Layout tar，表单提交 `os`、`architecture` 与可选 `variant`，返回裁剪后的 OCI tar；目标缺失、匹配不唯一或保留 blob 校验失败返回 400 |
 | `GET` | `/sample-image` | 下载样例镜像（含删除、opaque、硬链接覆盖） |
 | `GET` | `/healthz` | 健康检查 |
 
@@ -61,6 +70,36 @@ pytest                 # 运行测试
   符号链接逐层解析校验，任何逃逸都会让整次请求失败。
 - **请求隔离**：每个请求使用独立临时目录，失败即清理，成功响应发送后
   清理；请求之间互不影响。
+
+## 平台裁剪导出（`POST /export`）
+
+上传**未压缩**的 OCI Image Layout tar（可含多个平台与 BuildKit 证明），
+通过表单字段指定目标：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `os` | 是 | 目标操作系统，如 `linux` |
+| `architecture` | 是 | 目标架构，如 `amd64`、`arm64` |
+| `variant` | 否 | 目标变体，如 `v8`；不填则只匹配声明了**无** variant 的条目 |
+
+image config 中的 `os`、`architecture`、`variant` 精确比较；docker 媒体类型
+的清单若 config 缺少平台字段，回退到 index 描述符中的 `platform`。匹配不到
+或匹配到多个镜像时只返回错误。`index.json` 既可直接列出镜像清单，也可只引用
+**一个**子索引（该子索引再列清单）；两层索引都支持 docker / OCI 媒体类型。
+
+导出结果：
+
+- `index.json` 重写为只列被选中的镜像清单描述符（描述符按保留字节重建）；
+  `oci-layout` 原样保留；
+- 只保留被选中镜像的 manifest、config、各 layer，以及 `annotations` 中
+  `vnd.docker.reference.digest` 指向**该镜像清单**的 BuildKit 证明
+  （证明自身的 manifest / config / layer 一并保留）；
+- 保留的清单与所引 blob **沿用原字节**，layer 不展开、不改写；被多个描述符
+  共用的 blob 只写一份；裁掉的 blob 既不读取完整内容也不写入；
+- 每个保留 blob 复制时按块（1 MiB）读取并核对**字节大小与 SHA-256**，任何
+  不符即整次请求失败，不返回残缺 tar；
+- 未选中平台独有的 blob 即使整体缺失，导出仍可成功（这些平台不会被读取）；
+- 请求使用独立临时目录，输出先写临时文件再原子替换，失败即清理。
 
 ## 样例镜像内容
 

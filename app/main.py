@@ -1,18 +1,22 @@
-"""FastAPI service: unpack a single-manifest OCI Image Layout tar into rootfs.tar."""
+"""FastAPI service: unpack OCI Image Layout tars and export single-platform
+OCI layouts for isolated sites."""
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import tempfile
 from contextlib import asynccontextmanager
 from functools import partial
+from typing import Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
+from .exporter import export_platform
 from .sample_image import build_sample_image
 from .unpacker import CHUNK, UnpackError, unpack_image
 
@@ -22,6 +26,9 @@ WORK_ROOT = os.environ.get(
     "UNPACK_WORKDIR", os.path.join(tempfile.gettempdir(), "oci-unpacker")
 )
 SAMPLE_IMAGE_PATH = os.path.join(WORK_ROOT, "sample-image.tar")
+
+# os/architecture/variant become part of the output name; keep them boring.
+_SAFE_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 @asynccontextmanager
@@ -48,6 +55,9 @@ app = FastAPI(
         "* hardlink overwrite is byte-safe for the other end;\n"
         "* paths and links can never escape the per-request sandbox;\n"
         "* any missing/corrupt/illegal input fails the whole request.\n\n"
+        "`POST /export` takes a multi-platform layout and returns a pruned "
+        "layout with only the requested os/architecture[/variant], plus the "
+        "BuildKit attestations that reference that manifest.\n\n"
         "Try it: download `GET /sample-image`, then upload it to `POST /unpack`."
     ),
     lifespan=lifespan,
@@ -61,6 +71,7 @@ def root():
         "docs": "/docs",
         "endpoints": {
             "unpack": "POST /unpack",
+            "export_platform": "POST /export",
             "sample_image": "GET /sample-image",
             "healthz": "GET /healthz",
         },
@@ -84,6 +95,82 @@ def sample_image():
         raise HTTPException(status_code=404, detail="sample image not available")
     return FileResponse(
         SAMPLE_IMAGE_PATH, media_type="application/x-tar", filename="sample-image.tar"
+    )
+
+
+def _checked_part(value, field):
+    if not _SAFE_PART.match(value):
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid {field}: {value!r} "
+            "(letters, digits, dot, dash and underscore only)",
+        )
+    return value
+
+
+def _platform_file_stem(os_name, architecture, variant):
+    stem = f"{os_name}-{architecture}"
+    if variant:
+        stem += f"-{variant}"
+    return stem
+
+
+@app.post(
+    "/export",
+    summary="Export one platform's OCI Image Layout tar",
+    response_description="A pruned OCI Image Layout tar for the requested platform",
+    responses={
+        200: {"content": {"application/x-tar": {}}},
+        400: {
+            "description": "Target platform missing or ambiguous, or retained "
+            "blobs fail verification -- nothing is returned."
+        },
+    },
+)
+def export(
+    file: UploadFile = File(
+        ...,
+        description="Full, uncompressed OCI Image Layout tar, possibly "
+        "multi-platform and with BuildKit attestations",
+    ),
+    os_name: str = Form(..., alias="os", description="Target operating system, e.g. linux"),
+    architecture: str = Form(..., description="Target architecture, e.g. arm64"),
+    variant: Optional[str] = Form(
+        None,
+        description="Optional target variant, e.g. v8. Omit to match only "
+        "entries that declare no variant.",
+    ),
+):
+    os_name = _checked_part(os_name, "os")
+    architecture = _checked_part(architecture, "architecture")
+    if variant is not None:
+        variant = _checked_part(variant, "variant")
+
+    work = tempfile.mkdtemp(prefix="req-", dir=WORK_ROOT)
+    try:
+        upload_path = os.path.join(work, "upload.tar")
+        with open(upload_path, "wb") as out:
+            shutil.copyfileobj(file.file, out, CHUNK)
+        stem = _platform_file_stem(os_name, architecture, variant)
+        out_path = export_platform(
+            upload_path,
+            os.path.join(work, "export.tar"),
+            os_name,
+            architecture,
+            variant,
+        )
+    except UnpackError as exc:
+        shutil.rmtree(work, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        shutil.rmtree(work, ignore_errors=True)
+        logger.exception("unexpected error while exporting")
+        raise HTTPException(status_code=500, detail="internal error")
+    return FileResponse(
+        out_path,
+        media_type="application/x-tar",
+        filename=f"{stem}.tar",
+        background=BackgroundTask(partial(shutil.rmtree, work, ignore_errors=True)),
     )
 
 
